@@ -97,7 +97,8 @@ mcp = FastMCP(
         "PREREQUISITE: Outlook Desktop (Classic) must be running. The new/modern "
         "Outlook (olk.exe) is NOT supported — only the classic OUTLOOK.EXE.\n\n"
         "AVAILABLE TOOL CATEGORIES:\n"
-        "- Email: send, list, read, search, reply, mark read/unread, move, attachments\n"
+        "- Email: send, create drafts, list, read, search, reply, mark read/unread, "
+        "move, attachments\n"
         "- Calendar: list events, create appointments/meetings, update, delete, "
         "respond to invites, search events\n"
         "- Tasks: create, list, complete, update, delete to-do items\n"
@@ -302,6 +303,75 @@ async def send_email(
         return await bridge.call(_send, to, subject, body, cc, bcc, html_body, account)
     except Exception as e:
         return f"Error sending email: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL: create_draft
+# =====================================================================
+
+@mcp.tool()
+async def create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    display: bool = False,
+    account: str = "",
+) -> str:
+    """Create a draft email in Outlook without sending it.
+
+    Builds an email exactly like send_email but saves it to the Drafts
+    folder instead of sending. The draft can be reviewed, edited, and sent
+    later from Outlook, or programmatically via its returned entry_id.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+            Example: "alice@example.com" or "alice@example.com; bob@example.com"
+        subject: The email subject line.
+        body: The plain-text body of the email. If html_body is also provided,
+            both are set and Outlook will prefer the HTML version.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+        html_body: Optional. HTML-formatted body. When provided, Outlook renders
+            the email as HTML. The plain-text body serves as fallback.
+        display: Optional. If true, also open the draft in a compose window for
+            immediate review. Default false (saved quietly to the Drafts folder).
+        account: Optional. Account display name (or substring) to draft from.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        A confirmation message including the draft's entry_id, or an error.
+    """
+    def _draft(outlook, namespace, to, subject, body, cc, bcc, html_body, display, account):
+        store = _require_store(namespace, account)
+        mail = outlook.CreateItem(OL_MAIL_ITEM)
+        # Set the sending account
+        for acc in outlook.Session.Accounts:
+            if acc.DeliveryStore.StoreID == store.StoreID:
+                mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
+                break
+        mail.To = to
+        mail.Subject = subject
+        mail.Body = body
+        if cc:
+            mail.CC = cc
+        if bcc:
+            mail.BCC = bcc
+        if html_body:
+            mail.HTMLBody = html_body
+        mail.Save()
+        if display:
+            mail.Display(False)
+        return f"Draft created: '{subject}' to {to} (entry_id={mail.EntryID})"
+
+    try:
+        return await bridge.call(
+            _draft, to, subject, body, cc, bcc, html_body, display, account
+        )
+    except Exception as e:
+        return f"Error creating draft: {format_com_error(e)}"
 
 
 # =====================================================================
@@ -618,6 +688,65 @@ async def reply_email(
         return await bridge.call(_reply, entry_id, body, reply_all, account)
     except Exception as e:
         return f"Error replying to email: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL: create_draft_reply
+# =====================================================================
+
+@mcp.tool()
+async def create_draft_reply(
+    entry_id: str,
+    body: str,
+    reply_all: bool = False,
+    display: bool = False,
+    account: str = "",
+) -> str:
+    """Create a draft reply to an email without sending it.
+
+    Builds a reply exactly like reply_email (preserving the original message
+    thread) but saves it to the Drafts folder instead of sending. The draft
+    can be reviewed, edited, and sent later from Outlook.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email to reply to.
+        body: The reply message text. Prepended above the original message
+            in the email thread.
+        reply_all: If true, reply to all recipients (sender + all CC/To).
+            If false (default), reply only to the sender.
+        display: Optional. If true, also open the draft in a compose window for
+            immediate review. Default false (saved quietly to the Drafts folder).
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        A confirmation message including the draft reply's entry_id, or an error.
+    """
+    def _draft_reply(outlook, namespace, entry_id, body, reply_all, display, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+        subject = item.Subject
+        reply_item = item.ReplyAll() if reply_all else item.Reply()
+        reply_item.Body = body + "\n\n" + reply_item.Body
+        reply_item.Save()
+        if display:
+            reply_item.Display(False)
+        return (
+            f"Draft reply created for '{subject}' "
+            f"(reply_all={reply_all}, entry_id={reply_item.EntryID})"
+        )
+
+    try:
+        return await bridge.call(
+            _draft_reply, entry_id, body, reply_all, display, account
+        )
+    except Exception as e:
+        return f"Error creating draft reply: {format_com_error(e)}"
 
 
 # =====================================================================
