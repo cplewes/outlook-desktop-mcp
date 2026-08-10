@@ -17,6 +17,31 @@ import logging
 logger = logging.getLogger("outlook_desktop_mcp.com_bridge")
 
 
+# HRESULTs that indicate the cached Outlook COM object is dead (e.g. Outlook
+# was closed and reopened) and the connection should be re-established.
+_DISCONNECT_CODES = {
+    0x800706BA,  # RPC_S_SERVER_UNAVAILABLE
+    0x800706BE,  # RPC_S_CALL_FAILED
+    0x800706BF,  # RPC_S_CALL_FAILED_DNE
+    0x80010108,  # RPC_E_DISCONNECTED
+    0x800401FD,  # CO_E_OBJNOTCONNECTED
+    0x80080005,  # CO_E_SERVER_EXEC_FAILURE
+    0x80010105,  # RPC_E_SERVERFAULT
+}
+
+
+def _is_disconnect(e: Exception) -> bool:
+    """True if the exception is a COM error signalling a dead connection."""
+    hr = getattr(e, "hresult", None)
+    if hr is None:
+        args = getattr(e, "args", None)
+        if args:
+            hr = args[0]
+    if not isinstance(hr, int):
+        return False
+    return (hr & 0xFFFFFFFF) in _DISCONNECT_CODES
+
+
 class OutlookBridge:
     """Manages a dedicated COM thread for Outlook operations."""
 
@@ -43,15 +68,34 @@ class OutlookBridge:
                 "Is Outlook Desktop (Classic) running?"
             )
 
+    def _connect(self):
+        """(Re)acquire the Outlook COM objects. Must run on the COM thread."""
+        import win32com.client
+
+        self._outlook = win32com.client.Dispatch("Outlook.Application")
+        self._namespace = self._outlook.GetNamespace("MAPI")
+
+    def _reconnect(self) -> bool:
+        """Attempt to re-establish a dead Outlook connection. COM thread only."""
+        try:
+            logger.warning("Outlook COM connection lost; attempting to reconnect...")
+            self._connect()
+            # Touch the namespace to confirm the new connection is live.
+            _ = self._namespace.DefaultStore.DisplayName
+            logger.info("Reconnected to Outlook COM.")
+            return True
+        except Exception as e:
+            logger.error("Reconnect to Outlook failed: %s", e)
+            return False
+
     def _com_thread_main(self):
         """Main loop for the COM thread."""
         import pythoncom
-        import win32com.client
+        import win32com.client  # noqa: F401  (ensures COM modules load on this thread)
 
         pythoncom.CoInitialize()
         try:
-            self._outlook = win32com.client.Dispatch("Outlook.Application")
-            self._namespace = self._outlook.GetNamespace("MAPI")
+            self._connect()
             store_name = self._namespace.DefaultStore.DisplayName
             user_name = self._namespace.CurrentUser.Name
             logger.debug("COM thread ready. Store: %s, User: %s", store_name, user_name)
@@ -69,7 +113,17 @@ class OutlookBridge:
                         self._outlook, self._namespace, *args, **kwargs
                     )
                 except Exception as e:
-                    result_holder["error"] = e
+                    # If Outlook was closed/reopened, the cached COM object is
+                    # dead. Re-establish the connection and retry the call once.
+                    if _is_disconnect(e) and self._reconnect():
+                        try:
+                            result_holder["value"] = func(
+                                self._outlook, self._namespace, *args, **kwargs
+                            )
+                        except Exception as e2:
+                            result_holder["error"] = e2
+                    else:
+                        result_holder["error"] = e
                 finally:
                     result_event.set()
         except Exception as e:
