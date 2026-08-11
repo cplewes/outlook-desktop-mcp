@@ -1432,6 +1432,83 @@ async def search_events(
 # =====================================================================
 # TASK TOOLS
 # =====================================================================
+# TOOL: send_draft
+# =====================================================================
+
+
+@mcp.tool()
+async def send_draft(entry_id: str, account: str = "") -> str:
+    """Send an existing draft exactly as it stands.
+
+    Use this to send a draft that has already been written and reviewed.
+    send_email composes a NEW message, which leaves the original draft sitting
+    in the Drafts folder to be cleaned up afterwards and risks the two copies
+    diverging. send_draft sends the actual draft, so it leaves Drafts and lands
+    in Sent Items on its own.
+
+    Nothing about the message is altered. Revise with update_draft first if the
+    wording needs changing, then send.
+
+    Restricted to the Drafts folder: the parent folder is verified by EntryID
+    before sending, so this cannot be pointed at an arbitrary mail item.
+
+    THIS SENDS MAIL AND CANNOT BE UNDONE. Confirm the recipients, subject and
+    body with the user before calling it.
+
+    Args:
+        entry_id: EntryID of the draft. Get it from list_emails with
+            folder="drafts".
+        account: Optional. Account display name (or substring). Only needed if
+            entry_id is ambiguous across stores.
+
+    Returns:
+        Confirmation naming the recipients and subject that were sent.
+    """
+    def _send(outlook, namespace, entry_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            drafts = store.GetDefaultFolder(OL_FOLDER_DRAFTS)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+            drafts = namespace.GetDefaultFolder(OL_FOLDER_DRAFTS)
+
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+
+        try:
+            parent_id = item.Parent.EntryID
+        except Exception:
+            return "Error: could not determine the folder this item is in; refusing to send."
+
+        if parent_id != drafts.EntryID:
+            return (
+                "Error: refusing to send - this item is not in the Drafts "
+                "folder. send_draft only sends unsent drafts."
+            )
+
+        # Capture before sending; the item is not reliably readable afterwards.
+        subject = item.Subject
+        to = item.To or ""
+        cc = item.CC or ""
+
+        if not (to or cc or (item.BCC or "")):
+            return "Error: refusing to send - this draft has no recipients."
+
+        item.Send()
+
+        detail = f"to '{to}'"
+        if cc:
+            detail += f", cc '{cc}'"
+        return f"Draft sent: '{subject}' {detail}"
+
+    try:
+        return await bridge.call(_send, entry_id, account)
+    except Exception as e:
+        return f"Error sending draft: {format_com_error(e)}"
+
+
+# =====================================================================
 # TOOL: update_draft
 # =====================================================================
 
