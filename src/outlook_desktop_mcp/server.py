@@ -25,6 +25,7 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
     OL_FOLDER_TASKS,
+    OL_FOLDER_DRAFTS,
     OL_MEETING,
     OL_MEETING_CANCELED,
     OL_RESPONSE_TENTATIVE,
@@ -1430,6 +1431,67 @@ async def search_events(
 
 # =====================================================================
 # TASK TOOLS
+# =====================================================================
+# TOOL: delete_draft
+# =====================================================================
+
+
+@mcp.tool()
+async def delete_draft(entry_id: str, account: str = "") -> str:
+    """Delete an unsent draft message.
+
+    Deliberately restricted to the Drafts folder. The item's parent folder is
+    verified before anything is deleted, so passing the entry_id of an inbox
+    or sent message is refused rather than obeyed - this tool cannot be turned
+    into a general "delete any email" by choosing a different id.
+
+    The draft is moved to Deleted Items, not purged, so a mistake is
+    recoverable from Outlook.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the draft. Get it from
+            list_emails with folder="drafts".
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        Confirmation with the draft subject, or an error explaining the refusal.
+    """
+    def _delete(outlook, namespace, entry_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            drafts = store.GetDefaultFolder(OL_FOLDER_DRAFTS)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+            drafts = namespace.GetDefaultFolder(OL_FOLDER_DRAFTS)
+
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+
+        # The safety check. Compare parent folder identity, not folder name,
+        # so a localised or renamed folder cannot slip past it.
+        try:
+            parent_id = item.Parent.EntryID
+        except Exception:
+            return "Error: could not determine the folder this item is in; refusing to delete."
+
+        if parent_id != drafts.EntryID:
+            return (
+                "Error: refusing to delete - this item is not in the Drafts "
+                "folder. delete_draft only removes unsent drafts."
+            )
+
+        subject = item.Subject
+        item.Delete()
+        return f"Draft deleted (moved to Deleted Items): '{subject}'"
+
+    try:
+        return await bridge.call(_delete, entry_id, account)
+    except Exception as e:
+        return f"Error deleting draft: {format_com_error(e)}"
+
+
 # =====================================================================
 
 @mcp.tool()
