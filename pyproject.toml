@@ -21,7 +21,11 @@ classifiers = [
 ]
 dependencies = [
     "pywin32>=310; sys_platform == 'win32'",
-    "mcp[cli]>=1.26.0",
+    # Upper bound is deliberate. mcp 2.0.0 moved mcp.server.fastmcp, so a
+    # fresh install of this project against 2.x fails at import with
+    # "No module named 'mcp.server.fastmcp'". Existing venvs built before
+    # 2.0.0 released keep working only by accident of their install date.
+    "mcp[cli]>=1.26.0,<2",
 ]
 
 [project.urls]
