@@ -1432,6 +1432,118 @@ async def search_events(
 # =====================================================================
 # TASK TOOLS
 # =====================================================================
+# TOOL: update_draft
+# =====================================================================
+
+
+@mcp.tool()
+async def update_draft(
+    entry_id: str,
+    subject: str = "",
+    body: str = "",
+    to: str = "",
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    account: str = "",
+) -> str:
+    """Edit an existing unsent draft in place.
+
+    Use this to revise a draft instead of creating a second one. Without it the
+    only way to "change" a draft is to create another, which leaves duplicates
+    in the Drafts folder and invites sending the wrong copy.
+
+    Restricted to the Drafts folder: the item's parent folder is verified by
+    EntryID before anything is written, so an inbox or sent message cannot be
+    rewritten by passing its id.
+
+    Only the fields you supply are changed. An empty string means "leave this
+    field alone" - it does NOT clear the field. To remove all Cc or Bcc
+    recipients, do it in Outlook.
+
+    IMPORTANT: `body` replaces the ENTIRE plain-text body. On a draft made by
+    create_draft_reply that includes the quoted original message, passing a new
+    body discards the quote. To keep it, read the draft first and include the
+    quoted portion in the text you pass.
+
+    Args:
+        entry_id: EntryID of the draft. Get it from list_emails with
+            folder="drafts".
+        subject: Optional. New subject line.
+        body: Optional. New plain-text body (replaces the whole body).
+        to: Optional. New To recipients, semicolon separated. Replaces the
+            existing To list.
+        cc: Optional. New Cc recipients, semicolon separated.
+        bcc: Optional. New Bcc recipients, semicolon separated.
+        html_body: Optional. New HTML body.
+        account: Optional. Account display name (or substring). Only needed if
+            entry_id is ambiguous across stores.
+
+    Returns:
+        Confirmation naming the draft and which fields changed.
+    """
+    def _update(outlook, namespace, entry_id, subject, body, to, cc, bcc,
+                html_body, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            drafts = store.GetDefaultFolder(OL_FOLDER_DRAFTS)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+            drafts = namespace.GetDefaultFolder(OL_FOLDER_DRAFTS)
+
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+
+        # Same guard as delete_draft: compare folder identity, not name.
+        try:
+            parent_id = item.Parent.EntryID
+        except Exception:
+            return "Error: could not determine the folder this item is in; refusing to edit."
+
+        if parent_id != drafts.EntryID:
+            return (
+                "Error: refusing to edit - this item is not in the Drafts "
+                "folder. update_draft only revises unsent drafts."
+            )
+
+        changed = []
+        if subject:
+            item.Subject = subject
+            changed.append("subject")
+        if body:
+            item.Body = body
+            changed.append("body")
+        if html_body:
+            item.HTMLBody = html_body
+            changed.append("html_body")
+        if to:
+            item.To = to
+            changed.append("to")
+        if cc:
+            item.CC = cc
+            changed.append("cc")
+        if bcc:
+            item.BCC = bcc
+            changed.append("bcc")
+
+        if not changed:
+            return "Nothing to do: no fields were supplied."
+
+        item.Save()
+        return (
+            f"Draft updated: '{item.Subject}' (changed: {', '.join(changed)})"
+        )
+
+    try:
+        return await bridge.call(
+            _update, entry_id, subject, body, to, cc, bcc, html_body, account
+        )
+    except Exception as e:
+        return f"Error updating draft: {format_com_error(e)}"
+
+
+# =====================================================================
 # TOOL: delete_draft
 # =====================================================================
 
