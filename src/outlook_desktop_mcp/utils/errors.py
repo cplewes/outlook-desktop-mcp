@@ -5,6 +5,8 @@ _logger = logging.getLogger("outlook_desktop_mcp.errors")
 
 # HRESULTs seen coming out of Outlook COM. The symbolic name is worth more than
 # the number when a failure has to be diagnosed later from one line of a log.
+MAPI_E_INVALID_ENTRYID = 0x80040107
+
 _HRESULT_NAMES = {
     0x80020003: "DISP_E_MEMBERNOTFOUND",
     0x80020006: "DISP_E_UNKNOWNNAME",
@@ -14,9 +16,14 @@ _HRESULT_NAMES = {
     0x8001010A: "RPC_E_SERVERCALL_RETRYLATER",
     0x800401E3: "MK_E_UNAVAILABLE",
     0x80080005: "CO_E_SERVER_EXEC_FAILURE",
+    MAPI_E_INVALID_ENTRYID: "MAPI_E_INVALID_ENTRYID",
+    0x80040108: "MAPI_E_INVALID_OBJECT",
+    0x8004010A: "MAPI_E_OBJECT_DELETED",
     0x8004010F: "MAPI_E_NOT_FOUND",
     0x800706BA: "RPC_S_SERVER_UNAVAILABLE",
 }
+
+_HEX = set("0123456789abcdefABCDEF")
 
 # Enough to identify a fault, short enough that a provider string cannot turn a
 # tool result into a wall of text.
@@ -34,6 +41,63 @@ def _clean(value) -> str:
     if len(text) > _MAX_DETAIL:
         text = text[:_MAX_DETAIL] + "..."
     return text
+
+
+def check_entry_id(entry_id: str) -> str:
+    """Say why entry_id cannot be an Outlook EntryID, or "" if it looks plausible.
+
+    Only catches what is decidable without MAPI. A well-formed but wrong id gets
+    caught by Outlook itself; see invalid_entry_id_message.
+    """
+    if not entry_id:
+        return "entry_id is empty"
+    if entry_id.strip() != entry_id:
+        return "entry_id has leading or trailing whitespace; pass it through verbatim"
+    if any(c not in _HEX for c in entry_id):
+        return f"entry_id is not hexadecimal ({len(entry_id)} characters)"
+    if len(entry_id) % 2:
+        return (
+            f"entry_id has an odd length ({len(entry_id)} characters); an EntryID is "
+            "whole bytes, so at least one character is missing"
+        )
+    return ""
+
+
+def is_invalid_entry_id(e: Exception) -> bool:
+    """True when Outlook rejected an EntryID as malformed.
+
+    Arrives as DISP_E_EXCEPTION with the real code buried in EXCEPINFO's scode,
+    so both have to be checked.
+    """
+    try:
+        import pythoncom
+        if not isinstance(e, pythoncom.com_error):
+            return False
+        hr, _msg, exc, _arg = e.args
+        codes = {hr & 0xFFFFFFFF}
+        if exc and len(exc) > 5 and exc[5]:
+            codes.add(exc[5] & 0xFFFFFFFF)
+        return MAPI_E_INVALID_ENTRYID in codes
+    except Exception:
+        return False
+
+
+def invalid_entry_id_message(entry_id: str) -> str:
+    """What to tell a caller whose EntryID Outlook would not accept.
+
+    Observed cause: an EntryID contains a repeated 32-character block, and a
+    caller retyping it rather than copying it skips from the first occurrence to
+    the second, silently dropping 48 characters. The id stays hexadecimal and
+    even-length, so nothing but MAPI can catch it.
+    """
+    return (
+        f"Outlook rejected this entry_id as malformed (MAPI_E_INVALID_ENTRYID, "
+        f"0x{MAPI_E_INVALID_ENTRYID:08X}). The value supplied was {len(entry_id)} "
+        "characters. A correctly copied EntryID is accepted even when the item "
+        "itself cannot be read, so this means the value was altered or shortened "
+        "on the way here rather than that the message is missing. Re-fetch it from "
+        "list_emails or search_emails and pass it through verbatim without retyping."
+    )
 
 
 def format_com_error(e: Exception) -> str:

@@ -46,7 +46,12 @@ from outlook_desktop_mcp.utils.formatting import (
     format_task_summary,
     format_task_full,
 )
-from outlook_desktop_mcp.utils.errors import format_com_error
+from outlook_desktop_mcp.utils.errors import (
+    format_com_error,
+    check_entry_id,
+    is_invalid_entry_id,
+    invalid_entry_id_message,
+)
 
 # --- Logging (all to stderr, stdout is reserved for MCP JSON-RPC) ---
 
@@ -490,7 +495,17 @@ async def read_email(
     """
     def _read(outlook, namespace, entry_id, subject_search, folder, account):
         if entry_id:
-            item = namespace.GetItemFromID(entry_id)
+            if problem := check_entry_id(entry_id):
+                return json.dumps({"error": problem})
+            try:
+                item = namespace.GetItemFromID(entry_id)
+            except Exception as e:
+                # A truncated EntryID reads as "Exception occurred." otherwise,
+                # which sends the caller looking for a mailbox fault that is not
+                # there. Name what actually happened.
+                if is_invalid_entry_id(e):
+                    return json.dumps({"error": invalid_entry_id_message(entry_id)})
+                raise
             return json.dumps(format_email_full(item), indent=2, default=str)
 
         if not subject_search:
