@@ -36,11 +36,36 @@ def format_email_summary(item) -> dict:
     }
 
 
+def _recipients_by_type(item) -> tuple[str, str]:
+    """Build To/CC name lists from an item's Recipients collection.
+
+    Fallback for item types that carry recipients but expose no To/CC
+    properties (MeetingItem, i.e. meeting requests and responses).
+    """
+    to, cc = [], []
+    try:
+        recipients = item.Recipients
+        for i in range(1, recipients.Count + 1):
+            recipient = recipients.Item(i)
+            # olTo = 1, olCC = 2; anything else (BCC, resources) is skipped.
+            if recipient.Type == 2:
+                cc.append(recipient.Name)
+            else:
+                to.append(recipient.Name)
+    except Exception:
+        pass
+    return "; ".join(to), "; ".join(cc)
+
+
 def format_email_full(item, body_max_length: int = 5000) -> dict:
     """Extract full email details including body."""
     result = format_email_summary(item)
-    result["to"] = item.To or ""
-    result["cc"] = item.CC or ""
+    to = getattr(item, "To", None)
+    cc = getattr(item, "CC", None)
+    if to is None and cc is None:
+        to, cc = _recipients_by_type(item)
+    result["to"] = to or ""
+    result["cc"] = cc or ""
     result["body"] = truncate(item.Body or "", body_max_length)
     return result
 
