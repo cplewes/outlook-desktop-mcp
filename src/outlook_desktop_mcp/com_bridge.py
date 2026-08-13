@@ -12,9 +12,21 @@ import threading
 import queue
 import asyncio
 import sys
+import time
 import logging
 
 logger = logging.getLogger("outlook_desktop_mcp.com_bridge")
+
+# How long start() waits for Outlook before letting the server come up anyway,
+# and how often the COM thread retries afterwards.
+_STARTUP_GRACE = 15.0
+_RETRY_INTERVAL = 3.0
+
+_NOT_CONNECTED = (
+    "Outlook Desktop (Classic) is not reachable. The server is retrying in the "
+    "background and will start working as soon as classic OUTLOOK.EXE is running "
+    "in this session — restarting the MCP server is not required."
+)
 
 
 # HRESULTs that indicate the cached Outlook COM object is dead (e.g. Outlook
@@ -53,19 +65,26 @@ class OutlookBridge:
         self._ready = threading.Event()
         self._shutdown = threading.Event()
         self._init_error: Exception | None = None
+        self._connected = False
+        self._warned_unreachable = False
 
     def start(self):
-        """Start the COM thread. Call once at server startup."""
+        """Start the COM thread. Call once at server startup.
+
+        Never raises for an absent Outlook. A session and Outlook race each other
+        at boot on any machine with autologon, and a server that exits here stays
+        dead for the whole session, because MCP servers are not reloaded
+        mid-session. Come up regardless and keep trying in the background.
+        """
         self._thread = threading.Thread(
             target=self._com_thread_main, daemon=True, name="outlook-com"
         )
         self._thread.start()
-        if not self._ready.wait(timeout=15):
-            if self._init_error:
-                raise self._init_error
-            raise RuntimeError(
-                "Outlook COM thread failed to initialize within 15s. "
-                "Is Outlook Desktop (Classic) running?"
+        if not self._ready.wait(timeout=_STARTUP_GRACE):
+            logger.warning(
+                "Outlook not reachable after %.0fs (%s). Starting anyway and "
+                "retrying every %.0fs.",
+                _STARTUP_GRACE, self._init_error, _RETRY_INTERVAL,
             )
 
     def _connect(self):
@@ -75,18 +94,36 @@ class OutlookBridge:
         self._outlook = win32com.client.Dispatch("Outlook.Application")
         self._namespace = self._outlook.GetNamespace("MAPI")
 
-    def _reconnect(self) -> bool:
-        """Attempt to re-establish a dead Outlook connection. COM thread only."""
+    def _try_connect(self) -> bool:
+        """One connection attempt. COM thread only. Never raises."""
         try:
-            logger.warning("Outlook COM connection lost; attempting to reconnect...")
             self._connect()
             # Touch the namespace to confirm the new connection is live.
-            _ = self._namespace.DefaultStore.DisplayName
-            logger.info("Reconnected to Outlook COM.")
-            return True
+            store_name = self._namespace.DefaultStore.DisplayName
+            user_name = self._namespace.CurrentUser.Name
         except Exception as e:
-            logger.error("Reconnect to Outlook failed: %s", e)
+            self._connected = False
+            self._init_error = e
+            if not self._warned_unreachable:
+                # Only the first failure is loud; after that it is a poll.
+                logger.warning("Outlook not reachable: %s", e)
+                self._warned_unreachable = True
+            else:
+                logger.debug("Outlook still not reachable: %s", e)
             return False
+
+        self._connected = True
+        self._init_error = None
+        self._warned_unreachable = False
+        logger.info("Connected to Outlook. Store: %s, User: %s", store_name, user_name)
+        self._ready.set()
+        return True
+
+    def _reconnect(self) -> bool:
+        """Re-establish a dead Outlook connection. COM thread only."""
+        logger.warning("Outlook COM connection lost; attempting to reconnect...")
+        self._connected = False
+        return self._try_connect()
 
     def _com_thread_main(self):
         """Main loop for the COM thread."""
@@ -95,13 +132,14 @@ class OutlookBridge:
 
         pythoncom.CoInitialize()
         try:
-            self._connect()
-            store_name = self._namespace.DefaultStore.DisplayName
-            user_name = self._namespace.CurrentUser.Name
-            logger.debug("COM thread ready. Store: %s, User: %s", store_name, user_name)
-            self._ready.set()
-
+            next_attempt = 0.0
             while not self._shutdown.is_set():
+                # Keep trying to reach Outlook while idle, so a session that
+                # started before Outlook did heals itself without a restart.
+                if not self._connected and time.monotonic() >= next_attempt:
+                    if not self._try_connect():
+                        next_attempt = time.monotonic() + _RETRY_INTERVAL
+
                 try:
                     func, args, kwargs, result_event, result_holder = (
                         self._request_queue.get(timeout=0.5)
@@ -109,6 +147,8 @@ class OutlookBridge:
                 except queue.Empty:
                     continue
                 try:
+                    if not self._connected and not self._try_connect():
+                        raise RuntimeError(_NOT_CONNECTED)
                     result_holder["value"] = func(
                         self._outlook, self._namespace, *args, **kwargs
                     )
@@ -127,9 +167,10 @@ class OutlookBridge:
                 finally:
                     result_event.set()
         except Exception as e:
+            # Only reached if the loop itself breaks, not for an absent Outlook.
             self._init_error = e
-            self._ready.set()  # Unblock the caller so they see the error
-            logger.error("COM thread init failed: %s", e)
+            self._ready.set()
+            logger.error("COM thread failed: %s", e)
         finally:
             pythoncom.CoUninitialize()
 
