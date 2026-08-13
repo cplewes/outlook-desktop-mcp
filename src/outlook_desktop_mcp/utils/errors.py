@@ -101,6 +101,11 @@ def invalid_entry_id_message(entry_id: str) -> str:
 
 
 def format_com_error(e: Exception) -> str:
+    # Errors we raise deliberately already carry a usable message; wrapping them
+    # in "An unexpected error occurred" would bury the part worth reading.
+    if isinstance(e, ValueError):
+        return str(e)
+
     try:
         import pythoncom
         if isinstance(e, pythoncom.com_error):

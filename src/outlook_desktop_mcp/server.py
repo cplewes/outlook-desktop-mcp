@@ -111,11 +111,80 @@ mcp = FastMCP(
         "- Categories: list and set color categories on any item\n"
         "- Rules: list and manage mail rules\n"
         "- Out of Office: check auto-reply status\n"
-        "- Folders: list folder hierarchy with item counts"
+        "- Folders: list folder hierarchy with item counts\n\n"
+        "IDENTIFYING A MESSAGE: list_emails and search_emails return both a "
+        "140-character entry_id and an 8-character handle. Anything taking an "
+        "entry_id accepts either. PREFER THE HANDLE — a long EntryID contains a "
+        "repeated block and is easy to corrupt when copying, which produces a "
+        "message that cannot be found rather than an obvious error. Handles are "
+        "valid within this session only; if one is rejected, list again."
     ),
 )
 
 bridge = OutlookBridge()
+
+
+# --- Handles: short stand-ins for EntryIDs ---------------------------------
+#
+# An EntryID is 140 hex characters and contains a 32-character block twice.
+# Callers copying one by hand skip from the first occurrence to the second and
+# drop 48 characters; the result is still hex and still even-length, so nothing
+# catches it until MAPI rejects it. Every list/search result therefore carries an
+# 8-character handle, and anything taking an entry_id accepts one instead.
+#
+# Handles are session-scoped: the mapping lives in this process, so a handle from
+# a previous session is unknown rather than wrong. That is the intended failure —
+# it says to list again, and cannot silently address the wrong message.
+
+_HANDLE_LIMIT = 5000
+_handles: dict[str, str] = {}
+
+
+def _remember_handle(handle: str, entry_id: str) -> None:
+    if handle in _handles:
+        return
+    if len(_handles) >= _HANDLE_LIMIT:
+        for stale in list(_handles)[: _HANDLE_LIMIT // 5]:
+            del _handles[stale]
+    _handles[handle] = entry_id
+
+
+def _remember_summaries(summaries: list) -> list:
+    for row in summaries:
+        if isinstance(row, dict) and row.get("handle") and row.get("entry_id"):
+            _remember_handle(row["handle"], row["entry_id"])
+    return summaries
+
+
+# A real EntryID is far longer than this; anything shorter is a handle.
+_MAX_HANDLE_LEN = 32
+
+
+def _get_item(namespace, entry_id: str, store=None):
+    """Fetch an item by EntryID or by handle. Raises ValueError with a usable
+    message rather than letting a bare COM error reach the caller."""
+    value = (entry_id or "").strip()
+
+    if value and len(value) <= _MAX_HANDLE_LEN:
+        resolved = _handles.get(value.lower())
+        if not resolved:
+            raise ValueError(
+                f"Unknown handle '{value}'. Handles come from list_emails or "
+                "search_emails in this same session and are not valid across "
+                "sessions. List the folder again and use a handle from that result."
+            )
+        value = resolved
+    elif problem := check_entry_id(value):
+        raise ValueError(problem)
+
+    try:
+        if store is not None:
+            return namespace.GetItemFromID(value, store.StoreID)
+        return namespace.GetItemFromID(value)
+    except Exception as e:
+        if is_invalid_entry_id(e):
+            raise ValueError(invalid_entry_id_message(value)) from e
+        raise
 
 
 # --- Helper: resolve store by account name ---
@@ -242,7 +311,7 @@ async def list_accounts() -> str:
                 "store_id": store.StoreID,
                 "is_default": store.StoreID == default_id,
             })
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(_remember_summaries(results), indent=2, default=str)
 
     try:
         return await bridge.call(_list)
@@ -453,7 +522,7 @@ async def list_emails(
                 results.append(format_email_summary(items.Item(i + 1)))
             except Exception:
                 continue
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(_remember_summaries(results), indent=2, default=str)
 
     try:
         return await bridge.call(_list, folder, count, unread_only, start_date, end_date, account)
@@ -495,18 +564,13 @@ async def read_email(
     """
     def _read(outlook, namespace, entry_id, subject_search, folder, account):
         if entry_id:
-            if problem := check_entry_id(entry_id):
-                return json.dumps({"error": problem})
-            try:
-                item = namespace.GetItemFromID(entry_id)
-            except Exception as e:
-                # A truncated EntryID reads as "Exception occurred." otherwise,
-                # which sends the caller looking for a mailbox fault that is not
-                # there. Name what actually happened.
-                if is_invalid_entry_id(e):
-                    return json.dumps({"error": invalid_entry_id_message(entry_id)})
-                raise
-            return json.dumps(format_email_full(item), indent=2, default=str)
+            # _get_item validates the id, resolves a handle, and turns a
+            # truncated EntryID into a message that names the problem rather
+            # than the bare "Exception occurred." MAPI gives back.
+            item = _get_item(namespace, entry_id)
+            result = format_email_full(item)
+            _remember_handle(result["handle"], result["entry_id"])
+            return json.dumps(result, indent=2, default=str)
 
         if not subject_search:
             return json.dumps({"error": "Provide either entry_id or subject_search"})
@@ -525,7 +589,9 @@ async def read_email(
         if items.Count == 0:
             return json.dumps({"error": f"No email found matching '{subject_search}'"})
 
-        return json.dumps(format_email_full(items.Item(1)), indent=2, default=str)
+        found = format_email_full(items.Item(1))
+        _remember_handle(found["handle"], found["entry_id"])
+        return json.dumps(found, indent=2, default=str)
 
     try:
         return await bridge.call(_read, entry_id, subject_search, folder, account)
@@ -556,9 +622,9 @@ async def mark_as_read(entry_id: str, account: str = "") -> str:
     def _mark(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
@@ -595,9 +661,9 @@ async def mark_as_unread(entry_id: str, account: str = "") -> str:
     def _mark(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
@@ -639,7 +705,7 @@ async def move_email(
         Confirmation with email subject and destination, or an error.
     """
     def _move(outlook, namespace, entry_id, target_folder, account):
-        item = namespace.GetItemFromID(entry_id)
+        item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
@@ -689,9 +755,9 @@ async def reply_email(
     def _reply(outlook, namespace, entry_id, body, reply_all, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
@@ -741,9 +807,9 @@ async def create_draft_reply(
     def _draft_reply(outlook, namespace, entry_id, body, reply_all, display, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
@@ -1030,9 +1096,9 @@ async def get_event(entry_id: str, account: str = "") -> str:
     def _get(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         return json.dumps(format_event_full(item), indent=2, default=str)
 
     try:
@@ -1243,9 +1309,9 @@ async def update_event(
     def _update(outlook, namespace, entry_id, subject, start, end, location, body, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_APPOINTMENT, "appointment/meeting item"):
             return err
         if subject:
@@ -1300,9 +1366,9 @@ async def delete_event(entry_id: str, account: str = "") -> str:
     def _delete(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_APPOINTMENT, "appointment/meeting item"):
             return err
         subject = item.Subject
@@ -1362,9 +1428,9 @@ async def respond_to_meeting(
 
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_APPOINTMENT, "appointment/meeting item"):
             return err
         subject = item.Subject
@@ -1482,10 +1548,10 @@ async def send_draft(entry_id: str, account: str = "") -> str:
     def _send(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
             drafts = store.GetDefaultFolder(OL_FOLDER_DRAFTS)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
             drafts = namespace.GetDefaultFolder(OL_FOLDER_DRAFTS)
 
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
@@ -1578,10 +1644,10 @@ async def update_draft(
                 html_body, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
             drafts = store.GetDefaultFolder(OL_FOLDER_DRAFTS)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
             drafts = namespace.GetDefaultFolder(OL_FOLDER_DRAFTS)
 
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
@@ -1664,10 +1730,10 @@ async def delete_draft(entry_id: str, account: str = "") -> str:
     def _delete(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
             drafts = store.GetDefaultFolder(OL_FOLDER_DRAFTS)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
             drafts = namespace.GetDefaultFolder(OL_FOLDER_DRAFTS)
 
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
@@ -1760,9 +1826,9 @@ async def get_task(entry_id: str, account: str = "") -> str:
     def _get(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         return json.dumps(format_task_full(item), indent=2, default=str)
 
     try:
@@ -1850,9 +1916,9 @@ async def complete_task(entry_id: str, account: str = "") -> str:
     def _complete(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
             return err
         item.Status = OL_TASK_COMPLETE
@@ -1881,9 +1947,9 @@ async def delete_task(entry_id: str, account: str = "") -> str:
     def _delete(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
             return err
         subject = item.Subject
@@ -1915,9 +1981,9 @@ async def list_attachments(entry_id: str, account: str = "") -> str:
     def _list(outlook, namespace, entry_id, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         results = []
         for i in range(item.Attachments.Count):
             att = item.Attachments.Item(i + 1)
@@ -1960,9 +2026,9 @@ async def save_attachment(
     def _save(outlook, namespace, entry_id, attachment_index, save_directory, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         if attachment_index < 1 or item.Attachments.Count < attachment_index:
             return f"Error: Only {item.Attachments.Count} attachment(s), requested index {attachment_index}"
 
@@ -2058,9 +2124,9 @@ async def set_category(
     def _set(outlook, namespace, entry_id, categories, account):
         if account:
             store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
+            item = _get_item(namespace, entry_id, store)
         else:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item(namespace, entry_id)
         item.Categories = categories
         item.Save()
         return (

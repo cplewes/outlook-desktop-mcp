@@ -1,5 +1,17 @@
 """Helpers for extracting and formatting Outlook item data."""
+import hashlib
 import re
+
+
+def entry_handle(entry_id: str) -> str:
+    """A short stand-in for a 140-character EntryID.
+
+    Callers were mistyping EntryIDs: a valid one contains a 32-character block
+    twice, and copying it by hand tends to skip from the first occurrence to the
+    second, silently dropping 48 characters. Eight characters can be copied
+    correctly. The server keeps the mapping; see _get_item in server.py.
+    """
+    return hashlib.sha256(entry_id.encode("utf-8")).hexdigest()[:8]
 
 from outlook_desktop_mcp.tools._folder_constants import (
     BUSY_STATUS_NAMES,
@@ -24,8 +36,10 @@ def strip_html(html: str) -> str:
 
 def format_email_summary(item) -> dict:
     """Extract key fields from an Outlook MailItem into a dict."""
+    entry_id = item.EntryID
     return {
-        "entry_id": item.EntryID,
+        "handle": entry_handle(entry_id),
+        "entry_id": entry_id,
         "subject": item.Subject or "(no subject)",
         "sender": getattr(item, "SenderEmailAddress", "unknown"),
         "sender_name": getattr(item, "SenderName", "unknown"),
