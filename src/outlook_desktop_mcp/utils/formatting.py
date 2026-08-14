@@ -3,6 +3,15 @@ import hashlib
 import re
 
 
+from outlook_desktop_mcp.tools._folder_constants import (
+    BUSY_STATUS_NAMES,
+    MEETING_STATUS_NAMES,
+    RESPONSE_NAMES,
+    TASK_STATUS_NAMES,
+    IMPORTANCE_NAMES,
+)
+
+
 def entry_handle(entry_id: str) -> str:
     """A short stand-in for a 140-character EntryID.
 
@@ -13,13 +22,25 @@ def entry_handle(entry_id: str) -> str:
     """
     return hashlib.sha256(entry_id.encode("utf-8")).hexdigest()[:8]
 
-from outlook_desktop_mcp.tools._folder_constants import (
-    BUSY_STATUS_NAMES,
-    MEETING_STATUS_NAMES,
-    RESPONSE_NAMES,
-    TASK_STATUS_NAMES,
-    IMPORTANCE_NAMES,
-)
+
+def format_time(value) -> str:
+    """Render an Outlook time with an offset that is actually true.
+
+    Outlook hands back local times, but pywin32 wraps them in a GMT tzinfo, so
+    str() prints a local clock reading with a "+00:00" suffix. Verified against
+    the internet Date header of a real message: Outlook reported
+    "2026-08-14 05:09:53+00:00" for one whose header read
+    "Fri, 14 Aug 2026 11:09:46 +0000" - the same instant, stated six hours wrong.
+
+    Anything reading these timestamps to decide what is recent was being lied
+    to, so drop the bogus zone and attach the real local one.
+    """
+    if value is None:
+        return ""
+    try:
+        return value.replace(tzinfo=None).astimezone().isoformat(sep=" ")
+    except Exception:
+        return str(value)
 
 
 def truncate(text: str, max_length: int = 2000) -> str:
@@ -43,7 +64,7 @@ def format_email_summary(item) -> dict:
         "subject": item.Subject or "(no subject)",
         "sender": getattr(item, "SenderEmailAddress", "unknown"),
         "sender_name": getattr(item, "SenderName", "unknown"),
-        "received_time": str(item.ReceivedTime),
+        "received_time": format_time(item.ReceivedTime),
         "unread": bool(item.UnRead),
         "has_attachments": bool(item.Attachments.Count > 0),
         "attachment_count": item.Attachments.Count,
@@ -92,8 +113,8 @@ def format_event_summary(item) -> dict:
     return {
         "entry_id": item.EntryID,
         "subject": item.Subject or "(no subject)",
-        "start": str(item.Start),
-        "end": str(item.End),
+        "start": format_time(item.Start),
+        "end": format_time(item.End),
         "duration": item.Duration,
         "location": item.Location or "",
         "organizer": item.Organizer or "",
@@ -129,8 +150,8 @@ def format_task_summary(item) -> dict:
         "subject": item.Subject or "(no subject)",
         "status": TASK_STATUS_NAMES.get(item.Status, "unknown"),
         "percent_complete": item.PercentComplete,
-        "due_date": str(item.DueDate) if str(item.DueDate) != "01/01/4501" else None,
-        "start_date": str(item.StartDate) if str(item.StartDate) != "01/01/4501" else None,
+        "due_date": format_time(item.DueDate) if item.DueDate.year != 4501 else None,
+        "start_date": format_time(item.StartDate) if item.StartDate.year != 4501 else None,
         "importance": IMPORTANCE_NAMES.get(item.Importance, "normal"),
         "complete": bool(item.Complete),
         "categories": item.Categories or "",
@@ -144,6 +165,6 @@ def format_task_full(item, body_max_length: int = 5000) -> dict:
     result["body"] = truncate(item.Body or "", body_max_length)
     result["reminder_set"] = bool(item.ReminderSet)
     result["date_completed"] = (
-        str(item.DateCompleted) if item.Complete else None
+        format_time(item.DateCompleted) if item.Complete else None
     )
     return result
