@@ -124,8 +124,9 @@ def _unresolved_warning(unresolved: list[str]) -> str:
     """Text to append to a success message when some recipients didn't resolve."""
     if not unresolved:
         return ""
+    named = ", ".join(f"'{name}'" for name in unresolved)
     return (
-        f"\nWarning: Outlook could not resolve {', '.join(unresolved)}. "
+        f"\nWarning: Outlook could not resolve {named}. "
         "They are saved as typed, but sending will fail until they are "
         "corrected — check for a typo and fix with update_draft, or edit the "
         "draft in Outlook."
