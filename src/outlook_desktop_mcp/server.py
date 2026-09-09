@@ -87,6 +87,51 @@ def _check_item_class(item, expected_class: int, label: str) -> str | None:
     return None
 
 
+# --- Recipients: make addresses real before the draft is saved ---
+#
+# Assigning to .To/.CC/.BCC only stores display text. Until MAPI resolves it,
+# the draft holds unresolved names: Outlook underlines them in the compose
+# window, Send() fails with "Outlook does not recognize one or more names",
+# and a plain typo is never reported at all — the draft looks fine right up
+# until someone tries to send it. Resolving at write time turns that into an
+# answer at the point the caller can still act on it.
+
+
+def _resolve_recipients(item) -> list[str]:
+    """Resolve an item's recipients in place; return those that failed.
+
+    ResolveAll() says whether everything resolved but not what didn't, so walk
+    the collection afterwards for the names worth reporting back.
+    """
+    recipients = item.Recipients
+    if recipients.Count == 0:
+        return []
+    if recipients.ResolveAll():
+        return []
+
+    unresolved = []
+    for i in range(recipients.Count):
+        try:
+            recipient = recipients.Item(i + 1)
+            if not recipient.Resolved:
+                unresolved.append(recipient.Name)
+        except Exception:
+            continue
+    return unresolved
+
+
+def _unresolved_warning(unresolved: list[str]) -> str:
+    """Text to append to a success message when some recipients didn't resolve."""
+    if not unresolved:
+        return ""
+    return (
+        f"\nWarning: Outlook could not resolve {', '.join(unresolved)}. "
+        "They are saved as typed, but sending will fail until they are "
+        "corrected — check for a typo and fix with update_draft, or edit the "
+        "draft in Outlook."
+    )
+
+
 # --- MCP Server ---
 
 mcp = FastMCP(
@@ -401,6 +446,11 @@ async def create_draft(
     folder instead of sending. The draft can be reviewed, edited, and sent
     later from Outlook, or programmatically via its returned entry_id.
 
+    Recipients are resolved against the address book before the draft is
+    saved, so they arrive as real addressees rather than unchecked text. Any
+    that do not resolve - a typo, or a name Outlook cannot match - are named
+    in the returned message instead of surfacing later as a failure to send.
+
     Args:
         to: One or more recipient email addresses, separated by semicolons.
             Example: "alice@example.com" or "alice@example.com; bob@example.com"
@@ -436,10 +486,14 @@ async def create_draft(
             mail.BCC = bcc
         if html_body:
             mail.HTMLBody = html_body
+        unresolved = _resolve_recipients(mail)
         mail.Save()
         if display:
             mail.Display(False)
-        return f"Draft created: '{subject}' to {to} (entry_id={mail.EntryID})"
+        return (
+            f"Draft created: '{subject}' to {to} (entry_id={mail.EntryID})"
+            + _unresolved_warning(unresolved)
+        )
 
     try:
         return await bridge.call(
@@ -790,6 +844,9 @@ async def create_draft_reply(
     thread) but saves it to the Drafts folder instead of sending. The draft
     can be reviewed, edited, and sent later from Outlook.
 
+    Recipients carried over from the original are resolved before the draft is
+    saved; any that do not resolve are named in the returned message.
+
     Args:
         entry_id: The unique Outlook EntryID of the email to reply to.
         body: The reply message text. Prepended above the original message
@@ -815,12 +872,14 @@ async def create_draft_reply(
         subject = item.Subject
         reply_item = item.ReplyAll() if reply_all else item.Reply()
         reply_item.Body = body + "\n\n" + reply_item.Body
+        unresolved = _resolve_recipients(reply_item)
         reply_item.Save()
         if display:
             reply_item.Display(False)
         return (
             f"Draft reply created for '{subject}' "
             f"(reply_all={reply_all}, entry_id={reply_item.EntryID})"
+            + _unresolved_warning(unresolved)
         )
 
     try:
@@ -1619,6 +1678,10 @@ async def update_draft(
     field alone" - it does NOT clear the field. To remove all Cc or Bcc
     recipients, do it in Outlook.
 
+    When any recipient field is supplied, the draft's recipients are resolved
+    against the address book before saving, and any that do not resolve are
+    named in the returned message rather than left to fail at send time.
+
     IMPORTANT: `body` replaces the ENTIRE plain-text body. On a draft made by
     create_draft_reply that includes the quoted original message, passing a new
     body discards the quote. To keep it, read the draft first and include the
@@ -1688,9 +1751,11 @@ async def update_draft(
         if not changed:
             return "Nothing to do: no fields were supplied."
 
+        unresolved = _resolve_recipients(item) if (to or cc or bcc) else []
         item.Save()
         return (
             f"Draft updated: '{item.Subject}' (changed: {', '.join(changed)})"
+            + _unresolved_warning(unresolved)
         )
 
     try:
